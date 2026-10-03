@@ -1,0 +1,51 @@
+{
+  "name": "dsh-memory-vault",
+  "version": "0.2.0",
+  "description": "外置记忆库插件（hjj588 原版的修复分支）：为 dsh 提供长期记忆的增删改查、搜索、分类、归档工具，记忆数据保存在 ~/.dsh/memory/memory.db，与当前工作区无关。修复了对话记录重复堆积、标题被宿主注入消息污染、中期到长期压缩不可达三个缺陷。",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "test": "node --test test/memory-vault.test.js"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "src",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xs1023/dsh-memory-vault.git"
+  },
+  "homepage": "https://github.com/xs1023/dsh-memory-vault",
+  "bugs": {
+    "url": "https://github.com/xs1023/dsh-memory-vault/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "memory",
+    "memory-vault",
+    "long-term-memory"
+  ],
+  "license": "MIT",
+  "author": "xs1023 (maintainer of this fixed fork)",
+  "contributors": [
+    "hjj588 (original author of dsh-memory-vault)"
+  ],
+  "engines": {
+    "node": ">=22.18"
+  }
+}

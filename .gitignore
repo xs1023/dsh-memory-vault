@@ -1,0 +1,23 @@
+# 依赖
+node_modules/
+
+# 改修过程产生的备份文件，不进入版本库
+index.js.orig
+index.js.fixed*
+*.orig
+*.bak
+*.rej
+
+# 运行期数据（记忆库不属于本仓库）
+*.db
+*.db-journal
+*.db-wal
+*.sqlite*
+
+# 日志与编辑器/系统噪音
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
