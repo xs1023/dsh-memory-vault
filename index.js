@@ -187,6 +187,24 @@ function pluginMessage(content, tier) {
   });
 }
 
+// 判断一个会话的可见历史里是否已经注入过预设。
+// 这是跨进程的幂等依据：dsh 重启后内存标记会丢，但会话历史不会。
+// 预设注入带 source.kind='dsh-memory-vault' + memoryTier='preset'，据此精确识别
+// （不能用文本前缀匹配 —— 对话正文里讨论这个问题时也会出现同样的字样）。
+function sessionHasPresetInjection(session) {
+  try {
+    if (typeof session?.deriveMessages !== 'function') return false;
+    const derived = session.deriveMessages();
+    if (!Array.isArray(derived)) return false;
+    return derived.some(
+      (message) => message?.source?.kind === 'dsh-memory-vault'
+        && message.source.memoryTier === 'preset',
+    );
+  } catch {
+    return false;
+  }
+}
+
 function summarizeWithLlm(ctx, agent, text, mode) {
   const latest = agent?.session?.requestHeader?.()?.config;
   const agentTarget = agent?.options?.provider && agent?.options?.model
@@ -382,6 +400,10 @@ export function apply(ctx, config = {}) {
   // upsertConversationEntry()，把事件循环占死，web 端表现为连得上、没响应。
   const compressing = new Set();
 
+  // 已经注入过预设的会话 id。'agent/created' 会在同一个会话里反复触发，
+  // 这个内存标记是第一道闸门（挡住同进程内的重复触发，含消息尚未 splice 的窗口期）。
+  const presetInjectedSessions = new Set();
+
   // 自动把整段对话保存为一条“对话记录”，并执行分层压缩
   ctx.on('session/flush', async (session) => {
     const key = String(session?.id ?? '');
@@ -408,7 +430,21 @@ export function apply(ctx, config = {}) {
   ctx.on('agent/created', ({ agent }) => {
     try {
       const sessionId = agent?.session?.id ?? agent?.sessionId;
-      if (sessionId) agentsBySession.set(String(sessionId), agent);
+      const key = sessionId === undefined || sessionId === null ? null : String(sessionId);
+      if (key) agentsBySession.set(key, agent);
+
+      // 预设注入必须幂等。'agent/created' 会在同一个会话里反复触发，而 agent.inject()
+      // 只是往 inbox 追加一条 user 消息 —— 旧的不会被替换，于是每次触发都在历史里
+      // 多留一份【预设/用户记忆】，随重启次数线性增长（实测同一会话 11 分钟内 3 次）。
+      // 两道闸门配合：
+      //   1) 内存标记 —— 挡住同进程内的重复触发，含消息尚未 splice 的窗口期；
+      //   2) 历史扫描 —— 挡住重启 dsh 后恢复旧会话的情况（此时内存标记已清空）。
+      if (key && presetInjectedSessions.has(key)) return;
+      if (sessionHasPresetInjection(agent?.session)) {
+        if (key) presetInjectedSessions.add(key);
+        return;
+      }
+
       const presetRows = listEntries(db, { category: '预设' });
       if (!presetRows.length) return;
       // Same trap: rows are summaries without `content`, so each preset is
@@ -419,6 +455,7 @@ export function apply(ctx, config = {}) {
         .map((entry) => `- ${entry.title}\n  ${entry.content}`)
         .join('\n\n');
       agent.inject(pluginMessage(`【预设/用户记忆】\n${text}`, 'preset'));
+      if (key) presetInjectedSessions.add(key);
     } catch (error) {
       logError('injectPreset', error);
     }

@@ -33,6 +33,7 @@ import {
 } from '../src/db.js';
 
 import {
+  apply,
   captureConversation,
   maybeCompressSession,
   resolveTierConfig,
@@ -360,4 +361,129 @@ test('C2. 中期记忆累积超过阈值后应产出长期记忆，并清掉被�
     cfg.mediumTermLimit + 1 - cfg.mediumTermCompressCount,
     '被折叠进长期记忆的中期行应从库里删除',
   );
+});
+
+// ── D. 预设注入必须幂等 ────────────────────────────────────────
+//
+// 真实会话日志证明：'agent/created' 会在同一个会话里被反复触发
+// （session-6201a158 在 11 分钟内触发了 3 次：22:19:34 / 22:20:52 / 22:30:26），
+// 而旧的 agent.inject() 只是往 inbox 追加一条 user 消息，不做任何替换，
+// 于是每触发一次就在历史里多留一份【预设/用户记忆】，随重启次数线性增长。
+// 会话开头最终叠出 3 份预设、5 次注入记录，就是这么来的。
+
+/**
+ * 清理临时目录。
+ * 注意：apply() 内部打开的 sqlite 连接不会关闭，Windows 下文件仍被占用，
+ * rmSync 会抛 EPERM。临时目录留给系统回收即可，不因此判定用例失败。
+ */
+function cleanupDir(dir) {
+  try {
+    rmSync(dir, { recursive: true, force: true });
+  } catch {
+    /* 文件仍被 sqlite 占用，忽略 */
+  }
+}
+
+/** 造一个能捕获 agent/created 处理器的假 ctx */
+function bootPlugin(dir) {
+  const handlers = {};
+  const ctx = {
+    on: (event, handler) => {
+      handlers[event] = handler;
+    },
+    logger: { warn: () => {} },
+    tools: { register: () => {} },
+    get: () => undefined,
+  };
+  apply(ctx, { dataDir: dir });
+  return handlers;
+}
+
+/** inject() 会同时把消息写进 deriveMessages() 的可视列表，与真实行为一致 */
+function makeAgent(id, messages, injected) {
+  return {
+    session: { id, deriveMessages: () => messages },
+    inject: (message) => {
+      injected.push(message);
+      messages.push(message);
+    },
+  };
+}
+
+function seedPresets(dir) {
+  const db = openDb({ dataDir: dir });
+  addEntry(db, { title: '界面偏好', content: '偏好 DSH 原生 Web 界面', category: '预设' });
+  addEntry(db, { title: '回复风格', content: '保持专业严谨', category: '预设' });
+  db.close();
+}
+
+test('D1. 同一会话重复触发 agent/created，预设只注入一次', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'memory-vault-test-'));
+  t.after(() => cleanupDir(dir));
+  seedPresets(dir);
+
+  const handlers = bootPlugin(dir);
+  const messages = [];
+  const injected = [];
+  const agent = makeAgent('sess-dup', messages, injected);
+
+  // 复刻真实日志里的 3 次触发
+  handlers['agent/created']({ agent });
+  handlers['agent/created']({ agent });
+  handlers['agent/created']({ agent });
+
+  assert.equal(injected.length, 1, `预设应只注入一次，实际注入 ${injected.length} 次`);
+  assert.ok(
+    injected[0].content[0].text.startsWith('【预设/用户记忆】'),
+    '注入内容应为预设记忆',
+  );
+});
+
+test('D2. 会话历史里已有预设时不再注入（重启 dsh 后恢复旧会话）', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'memory-vault-test-'));
+  t.after(() => cleanupDir(dir));
+  seedPresets(dir);
+
+  // 新进程：内存标记为空，但历史里已留下上一次注入的那一份
+  const handlers = bootPlugin(dir);
+  const messages = [pluginMsg('p-old', 'preset', '【预设/用户记忆】\n- 上一轮注入的那一份')];
+  const injected = [];
+  const agent = makeAgent('sess-hist', messages, injected);
+
+  handlers['agent/created']({ agent });
+
+  assert.equal(injected.length, 0, '历史里已有预设注入时不应再注入一份');
+});
+
+test('D3. 不同会话各自注入一次，去重不得跨会话误伤', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'memory-vault-test-'));
+  t.after(() => cleanupDir(dir));
+  seedPresets(dir);
+
+  const handlers = bootPlugin(dir);
+  const injectedA = [];
+  const injectedB = [];
+  const agentA = makeAgent('sess-a', [], injectedA);
+  const agentB = makeAgent('sess-b', [], injectedB);
+
+  handlers['agent/created']({ agent: agentA });
+  handlers['agent/created']({ agent: agentB });
+  handlers['agent/created']({ agent: agentA });
+
+  assert.equal(injectedA.length, 1, 'A 会话应恰好注入一次');
+  assert.equal(injectedB.length, 1, 'B 会话应恰好注入一次，不应被 A 的去重标记挡住');
+});
+
+test('D4. 没有预设时不注入', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'memory-vault-test-'));
+  t.after(() => cleanupDir(dir));
+
+  const handlers = bootPlugin(dir);
+  const messages = [];
+  const injected = [];
+  const agent = makeAgent('sess-empty', messages, injected);
+
+  handlers['agent/created']({ agent });
+
+  assert.equal(injected.length, 0, '记忆库里没有预设时不应注入任何内容');
 });
