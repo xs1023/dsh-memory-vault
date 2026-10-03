@@ -36,16 +36,16 @@ npm test
 
 ### 从 GitHub 安装（推荐）
 
-```text
-dsh plugin --profile <profile 名> add github:xs1023/dsh-memory-vault
+```bash
+dsh plugin --profile web add github:xs1023/dsh-memory-vault
 ```
 
-把 `<profile 名>` 换成你实际使用的 profile，例如 `web` 或 `web-desktop`。装完重启 dsh 生效。
+把 `web` 换成你实际使用的 profile（例如 `web-desktop`）。装完重启 dsh 生效。
 
 ### 从本地源码安装
 
-```text
-dsh plugin --profile <profile 名> add <本仓库的绝对路径>
+```bash
+dsh plugin --profile web add /本仓库的绝对路径/dsh-memory-vault
 ```
 
 重启后可以在「设置 → 插件 → 管理」里看到 `dsh-memory-vault`。
