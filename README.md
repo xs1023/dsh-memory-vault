@@ -131,6 +131,40 @@ dsh plugin --profile web add /本仓库的绝对路径/dsh-memory-vault
 - 本插件不做自动备份；升级或手工清理前建议先复制一份该文件
 - 删除条目依赖 `PRAGMA foreign_keys = ON` 级联清理标签关联，请勿用外部工具绕过插件直接改库，否则会留下孤儿关联行
 
+## 本地开发
+
+### 仓库结构
+
+| 路径 | 作用 |
+| --- | --- |
+| `index.js` | 宿主半侧：注册 18 个 `memory_*` 工具、预设注入、对话记录与分层压缩 |
+| `src/db.js` | 数据层：建表与迁移、增删改查、项目维度过滤、输出格式化 |
+| `test/memory-vault.test.js` | 回归测试，每个用例对应一个真实踩过的坑 |
+| `cordis.patch.yml` | 挂载声明：让 dsh 把本包挂进配置树 |
+
+**零运行时依赖**：只用 Node 内置的 `node:sqlite`，不需要 `pnpm install`。要求 Node ≥ 22.18（`node:sqlite` 的可用版本）。
+
+### 改完怎么验证
+
+```bash
+npm test     # 等价于 node --test test/memory-vault.test.js，22 个用例
+```
+
+用例全部跑在临时目录里的新库上（`openDb({ dataDir })`），**不会碰** `~/.dsh/memory/memory.db`。想拿真实数据试迁移时也别直接动生产库：`src/db.js` 支持 `DSH_MEMORY_DB`（库文件）与 `DSH_MEMORY_DIR`（目录）覆盖，先复制一份、指着副本跑。插件的 `config.dataDir` 同理。
+
+### 改完怎么生效
+
+宿主半侧的代码在 dsh 启动时加载，所以**改完必须重启 dsh**。生效方式取决于安装方式：
+
+- **link 到源码目录**（开发时推荐）：`dsh plugin --profile web add <本仓库绝对路径>`。改完重启即生效，不需要复制文件。
+- **从 GitHub 安装**：dsh 加载的是安装那一刻的副本，改本地源码不会生效——需要重新 `dsh plugin --profile web add github:xs1023/dsh-memory-vault` 再重启。
+
+### 数据库结构变更的约定
+
+按现有模式走：`CREATE TABLE IF NOT EXISTS` 里带上新列，再补一次幂等的 `ALTER TABLE … ADD COLUMN`（旧库升级）与对应的 `CREATE INDEX IF NOT EXISTS`。
+
+**存量行必须保持可解释。** 项目维度就是范例：升级前的行一律留在 `NULL`（全局），默认检索照样看得见它们，绝不会把旧记忆重新归属到某个项目、让使用者以为数据丢了。对应的回归用例是 E4。
+
 ## 许可
 
 MIT License。原始版权归 [hjj588](https://github.com/hjj588) 所有，本分支的修改部分版权归 xs1023，完整条款见 [LICENSE](LICENSE)。
