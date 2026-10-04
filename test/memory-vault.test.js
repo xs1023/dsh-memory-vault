@@ -19,6 +19,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { DatabaseSync } from 'node:sqlite';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -30,12 +31,14 @@ import {
   listEntries,
   findEntryBySessionId,
   upsertConversationEntry,
+  workspaceLabel,
 } from '../src/db.js';
 
 import {
   apply,
   captureConversation,
   maybeCompressSession,
+  normalizeScope,
   resolveTierConfig,
 } from '../index.js';
 
@@ -486,4 +489,168 @@ test('D4. 没有预设时不注入', (t) => {
   handlers['agent/created']({ agent });
 
   assert.equal(injected.length, 0, '记忆库里没有预设时不应注入任何内容');
+});
+
+// ── E. 项目维度（工作区归属）──────────────────────────────────
+//
+// 加这一维是为了让「多个 agent / 一个父 agent 带多个 subagent」干同一个项目时，
+// 检索自动收窄到本项目，同时不改变原来的全局语义。五条真实风险：
+//
+//   E1 默认检索漏掉全局条目，或者串到别的项目。
+//   E2 会话拿不到 cwd（旧会话、宿主未提供）时若照样过滤，记忆会静默消失。
+//   E3 scope 参数写错不得退化成全库检索 —— 一个笔误就让隔离形同虚设。
+//   E4 旧库补列迁移不得把存量行重新归属到某个项目。
+//   E5 工具层必须真的按会话 cwd 入库，否则这一维只是个摆设。
+
+const PROJ_A = 'C:\\work\\proj-a';
+const PROJ_B = '/home/me/proj-b';
+/** cwd 归一化后的期望值：统一正斜杠、去掉尾部分隔符 */
+const PROJ_A_KEY = 'C:/work/proj-a';
+
+/** 造一个能同时捕获事件处理器与已注册工具的假 ctx */
+function bootPluginTools(dir) {
+  const handlers = {};
+  const tools = new Map();
+  const ctx = {
+    on: (event, handler) => {
+      handlers[event] = handler;
+    },
+    logger: { warn: () => {} },
+    tools: { register: (tool) => tools.set(tool.name, tool) },
+    get: () => undefined,
+  };
+  apply(ctx, { dataDir: dir });
+  return { handlers, tools };
+}
+
+function seedProjects(db) {
+  addEntry(db, { title: '全局：通用约定', content: '所有项目都适用', category: '全局约定' });
+  addEntry(db, { title: 'A：接口约定', content: 'A 项目的接口', category: '项目知识', workspaceId: PROJ_A });
+  addEntry(db, { title: 'B：部署流程', content: 'B 项目的部署', category: '项目知识', workspaceId: PROJ_B });
+}
+
+test('E1. 默认检索 = 当前项目 + 全局，既不丢全局也不串项目', (t) => {
+  const db = freshDb(t);
+  seedProjects(db);
+
+  const current = listEntries(db, { workspaceId: PROJ_A, workspaceScope: 'current' })
+    .map((row) => row.title)
+    .sort();
+  assert.deepEqual(current, ['A：接口约定', '全局：通用约定'].sort());
+
+  const globalOnly = listEntries(db, { workspaceScope: 'global' }).map((row) => row.title);
+  assert.deepEqual(globalOnly, ['全局：通用约定']);
+
+  const all = listEntries(db, { workspaceScope: 'all' }).map((row) => row.title);
+  assert.equal(all.length, 3, 'all 应看到全部三个维度的条目');
+});
+
+test('E2. 拿不到 cwd 时退化为不过滤，不得静默丢记忆', (t) => {
+  const db = freshDb(t);
+  seedProjects(db);
+
+  // 旧会话或宿主没给 cwd：workspaceId 为空
+  const rows = listEntries(db, { workspaceScope: 'current' });
+  assert.equal(rows.length, 3, '没有项目归属时不应过滤掉任何条目');
+});
+
+test('E3. 未知 scope 一律按 current 处理，不得退化成全库检索', () => {
+  assert.equal(normalizeScope('All'), 'all', '取值应大小写不敏感');
+  assert.equal(normalizeScope('  ALL  '), 'all', '首尾空白应被容忍');
+  assert.equal(normalizeScope('everything'), 'current', '拼错的取值不得放行全库');
+  assert.equal(normalizeScope(undefined), 'current');
+  assert.equal(normalizeScope('global'), 'global');
+  assert.equal(normalizeScope('all'), 'all');
+});
+
+test('E4. 旧库补列迁移：存量行必须是全局，默认检索仍然看得见', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'memory-vault-legacy-'));
+  t.after(() => cleanupDir(dir));
+
+  // 造一个「改动前」的库：没有 workspace_id 列
+  const raw = new DatabaseSync(join(dir, 'memory.db'));
+  raw.exec(`CREATE TABLE entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    content TEXT NOT NULL DEFAULT '',
+    category TEXT NOT NULL DEFAULT '未分类',
+    pinned INTEGER NOT NULL DEFAULT 0,
+    archived INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`);
+  const stamp = new Date().toISOString();
+  raw
+    .prepare('INSERT INTO entries (title, content, category, created_at, updated_at) VALUES (?, ?, ?, ?, ?)')
+    .run('迁移前的记忆', '旧内容', '未分类', stamp, stamp);
+  raw.close();
+
+  const db = openDb({ dataDir: dir });
+  t.after(() => db.close());
+
+  const columns = db.prepare('PRAGMA table_info(entries)').all().map((row) => row.name);
+  assert.ok(columns.includes('workspace_id'), '打开旧库时应补出 workspace_id 列');
+
+  const entry = getEntry(db, 1);
+  assert.equal(entry.workspace_id, null, '存量行不得被重新归属到某个项目');
+
+  const visible = listEntries(db, { workspaceId: PROJ_A, workspaceScope: 'current' });
+  assert.deepEqual(visible.map((row) => row.title), ['迁移前的记忆']);
+});
+
+test('E5. 工具层按会话 cwd 写项目、按 scope 写全局，默认检索不串项目', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'memory-vault-tools-'));
+  t.after(() => cleanupDir(dir));
+
+  const { tools } = bootPluginTools(dir);
+  const exec = { agent: { session: { header: { cwd: PROJ_A } } } };
+
+  const added = await tools.get('memory_add').execute({ title: 'A 的记忆', content: 'x' }, exec);
+  assert.match(added, /归属项目/, '写入回执应说明落到了哪个项目');
+
+  await tools.get('memory_add').execute({ title: '全局的记忆', content: 'y', scope: 'global' }, exec);
+
+  const db = openDb({ dataDir: dir });
+  t.after(() => db.close());
+
+  const byTitle = new Map(
+    listEntries(db, { workspaceScope: 'all' }).map((row) => [row.title, row.workspace_id]),
+  );
+  assert.equal(byTitle.get('A 的记忆'), PROJ_A_KEY, 'cwd 应归一成正斜杠后再入库');
+  assert.equal(byTitle.get('全局的记忆'), null);
+
+  addEntry(db, { title: 'B 的记忆', content: 'z', workspaceId: PROJ_B });
+  const found = await tools.get('memory_search').execute({ query: '的记忆' }, exec);
+  assert.match(found, /A 的记忆/);
+  assert.match(found, /全局的记忆/);
+  assert.ok(!found.includes('B 的记忆'), '默认检索不得串到别的项目');
+
+  const all = await tools.get('memory_search').execute({ query: '的记忆', scope: 'all' }, exec);
+  assert.match(all, /B 的记忆/, 'scope=all 才应看到别的项目');
+});
+
+test('E6. 对话记录随会话落到对应项目', async (t) => {
+  const db = freshDb(t);
+  const session = {
+    id: 'sess-proj',
+    header: { cwd: PROJ_A },
+    deriveMessages: () => [userMsg('u1', 'A 项目的一句话'), assistantMsg('a1', '好的')],
+  };
+
+  await captureConversation(session, db);
+
+  const mine = listEntries(db, { category: '对话记录', workspaceId: PROJ_A, workspaceScope: 'current' });
+  assert.equal(mine.length, 1);
+  assert.equal(getEntry(db, mine[0].id).workspace_id, PROJ_A_KEY);
+
+  const other = listEntries(db, { category: '对话记录', workspaceId: PROJ_B, workspaceScope: 'current' });
+  assert.equal(other.length, 0, '别的项目不应看到这条对话记录');
+});
+
+test('E7. 展示用的项目名取归一化后的末段，不得把整条路径铺出来', () => {
+  assert.equal(workspaceLabel(PROJ_A), 'proj-a', 'Windows 反斜杠路径也要取到末段');
+  assert.equal(workspaceLabel(PROJ_A_KEY), 'proj-a');
+  assert.equal(workspaceLabel('C:\\work\\proj-a\\'), 'proj-a', '尾部分隔符应先归一化掉');
+  assert.equal(workspaceLabel(PROJ_B), 'proj-b');
+  assert.equal(workspaceLabel(null), null, '全局条目没有项目名');
 });
