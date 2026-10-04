@@ -35,6 +35,7 @@ export function openDb(config = {}) {
       pinned INTEGER NOT NULL DEFAULT 0,
       archived INTEGER NOT NULL DEFAULT 0,
       session_id TEXT,
+      workspace_id TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -61,13 +62,39 @@ export function openDb(config = {}) {
     // 列已存在时忽略
   }
 
-  // 补列完成后才创建依赖 session_id 的索引（旧库升级顺序：建表 → 补列 → 建索引）
+  // 旧数据库升级：补 workspace_id（项目维度）。
+  // 存量行的 workspace_id 保持 NULL，语义是“全局”：它们本来就是跨项目攒下来的，
+  // 迁移不得把它们重新归属到某个项目，否则默认检索会突然看不到旧记忆。
+  try {
+    db.exec('ALTER TABLE entries ADD COLUMN workspace_id TEXT');
+  } catch {
+    // 列已存在时忽略
+  }
+
+  // 补列完成后才创建依赖列的索引（旧库升级顺序：建表 → 补列 → 建索引）
   db.exec('CREATE INDEX IF NOT EXISTS idx_entries_session ON entries(session_id)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_entries_workspace ON entries(workspace_id)');
 
   return db;
 }
 
 export const now = () => new Date().toISOString();
+
+/**
+ * 把会话 cwd 归一成工作区标识（项目维度）。
+ *
+ * 统一成正斜杠并去掉尾部分隔符，使同一目录在不同写法下落到同一个键
+ * （`C:\work\a\` 与 `C:/work/a` 等价）。大小写不折叠：DSH 传入的是会话创建时
+ * 校验过的绝对路径，同一工作区在同一台机器上的写法是一致的。
+ *
+ * 返回 null 表示“没有项目归属”，也就是全局条目。
+ */
+export function normalizeWorkspaceId(cwd) {
+  if (typeof cwd !== 'string') return null;
+  const trimmed = cwd.trim().replace(/[\\/]+$/, '');
+  if (!trimmed) return null;
+  return trimmed.replace(/\\/g, '/');
+}
 
 export function splitTags(tagInput) {
   if (!tagInput) return [];
@@ -105,14 +132,29 @@ export function getTags(db, entryId) {
 }
 
 
-export function addEntry(db, { title, content = '', category = '未分类', tags = [], sessionId = null }) {
+export function addEntry(db, {
+  title,
+  content = '',
+  category = '未分类',
+  tags = [],
+  sessionId = null,
+  workspaceId = null,
+}) {
   const createdAt = now();
   const info = db
     .prepare(
-      `INSERT INTO entries (title, content, category, session_id, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?)`
+      `INSERT INTO entries (title, content, category, session_id, workspace_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
     )
-    .run(title, content, category || '未分类', sessionId, createdAt, createdAt);
+    .run(
+      title,
+      content,
+      category || '未分类',
+      sessionId,
+      normalizeWorkspaceId(workspaceId),
+      createdAt,
+      createdAt,
+    );
   const entryId = Number(info.lastInsertRowid);
   replaceTags(db, entryId, tags);
   return entryId;
@@ -138,19 +180,31 @@ export function findEntryBySessionId(db, sessionId, category = '对话记录') {
   return { ...entry, tags: getTags(db, entry.id) };
 }
 
-export function upsertConversationEntry(db, { sessionId, title, content, category = '对话记录', tags = [] }) {
+export function upsertConversationEntry(db, {
+  sessionId,
+  title,
+  content,
+  category = '对话记录',
+  tags = [],
+  workspaceId,
+}) {
   const existing = findEntryBySessionId(db, sessionId, category);
   const timestamp = now();
   if (existing) {
+    // workspaceId 未传（undefined）时保留原值，避免把已有归属清成全局；
+    // 只有显式传 null 才表示“改成全局”。
+    const nextWorkspaceId = workspaceId === undefined
+      ? existing.workspace_id
+      : normalizeWorkspaceId(workspaceId);
     db.prepare(
       `UPDATE entries
-          SET title = ?, content = ?, category = ?, updated_at = ?
+          SET title = ?, content = ?, category = ?, workspace_id = ?, updated_at = ?
         WHERE id = ?`
-    ).run(title, content, category, timestamp, existing.id);
+    ).run(title, content, category, nextWorkspaceId ?? null, timestamp, existing.id);
     replaceTags(db, existing.id, tags);
     return existing.id;
   }
-  return addEntry(db, { title, content, category, tags, sessionId });
+  return addEntry(db, { title, content, category, tags, sessionId, workspaceId });
 }
 
 export function getEntry(db, entryId) {
@@ -168,6 +222,8 @@ export function listEntries(db, options = {}) {
     archivedOnly = false,
     excludeCategory,
     sessionId,
+    workspaceId,
+    workspaceScope = 'current',
   } = options;
 
   const conditions = [];
@@ -186,6 +242,19 @@ export function listEntries(db, options = {}) {
   if (sessionId) {
     conditions.push('e.session_id = ?');
     params.push(sessionId);
+  }
+
+  // 项目维度过滤，三态语义：
+  //   all     —— 不过滤（改动前的行为，也是显式跨项目检索的入口）
+  //   global  —— 只看全局条目（workspace_id IS NULL）：预设与历史积累
+  //   current —— 默认：当前项目 + 全局；当前项目未知（会话没有 cwd）时退化为不过滤，
+  //              这样拿不到归属的场景不会静默丢掉记忆
+  const scopedWorkspaceId = normalizeWorkspaceId(workspaceId);
+  if (workspaceScope === 'global') {
+    conditions.push('e.workspace_id IS NULL');
+  } else if (workspaceScope !== 'all' && scopedWorkspaceId) {
+    conditions.push('(e.workspace_id = ? OR e.workspace_id IS NULL)');
+    params.push(scopedWorkspaceId);
   }
 
   if (tag) {
@@ -218,6 +287,7 @@ export function listEntries(db, options = {}) {
               e.category,
               e.pinned,
               e.archived,
+              e.workspace_id,
               e.updated_at,
               (SELECT GROUP_CONCAT(t.name, ',')
                  FROM entry_tags et
@@ -231,11 +301,14 @@ export function listEntries(db, options = {}) {
 }
 
 export function updateEntry(db, entryId, fields = {}, tags) {
-  const allowed = ['title', 'content', 'category', 'sessionId'];
+  const allowed = ['title', 'content', 'category', 'sessionId', 'workspaceId'];
+  const column = { sessionId: 'session_id', workspaceId: 'workspace_id' };
   const updates = {};
   for (const key of allowed) {
     if (fields[key] !== undefined) {
-      updates[key === 'sessionId' ? 'session_id' : key] = fields[key];
+      updates[column[key] ?? key] = key === 'workspaceId'
+        ? normalizeWorkspaceId(fields[key])
+        : fields[key];
     }
   }
 
@@ -296,11 +369,24 @@ export function renameCategory(db, oldName, newName) {
   return info.changes;
 }
 
+/**
+ * 只用于展示：从工作区标识里取末段目录名，避免把长路径铺进列表。
+ * 调用方可能传原始 cwd（Windows 反斜杠），所以先归一化再取末段。
+ * 返回 null 表示全局条目。
+ */
+export function workspaceLabel(workspaceId) {
+  const normalized = normalizeWorkspaceId(workspaceId);
+  if (!normalized) return null;
+  const parts = normalized.split('/').filter(Boolean);
+  return parts[parts.length - 1] || normalized;
+}
+
 export function formatList(rows) {
   if (!rows.length) return '（没有找到记忆条目）';
   const lines = rows.map((row) => {
     const status = row.archived ? ' [已归档]' : '';
-    return `【${row.id}】${row.title}${status}｜分类：${row.category}｜标签：${row.tags || '无'}｜更新：${row.updated_at}`;
+    const project = workspaceLabel(row.workspace_id) ?? '全局';
+    return `【${row.id}】${row.title}${status}｜分类：${row.category}｜项目：${project}｜标签：${row.tags || '无'}｜更新：${row.updated_at}`;
   });
   return lines.join('\n');
 }
@@ -310,6 +396,7 @@ export function formatEntry(entry) {
     `编号（ID）：${entry.id}`,
     `标题：${entry.title}`,
     `分类：${entry.category}`,
+    `项目归属：${workspaceLabel(entry.workspace_id) ?? '（全局）'}`,
     `标签：${entry.tags.length ? entry.tags.join('、') : '（无）'}`,
     `状态：${entry.archived ? '已归档' : '正常'}${entry.pinned ? '，已置顶' : ''}`,
     `创建时间：${entry.created_at}`,

@@ -29,6 +29,7 @@ import {
   upsertConversationEntry,
   formatList,
   formatEntry,
+  workspaceLabel,
 } from './src/db.js';
 
 import { randomUUID } from 'node:crypto';
@@ -102,6 +103,32 @@ function isRawChatMessage(message) {
   return message.role === 'assistant';
 }
 
+/**
+ * 会话的项目归属（工作区维度）。
+ *
+ * DSH 把会话创建时校验过的绝对路径放在 SessionHeader.cwd。拿不到时返回 null，
+ * 语义是“没有项目归属”：检索侧会退化成不过滤，而不是静默丢掉记忆。
+ */
+export function sessionWorkspace(session) {
+  return session?.header?.cwd ?? null;
+}
+
+/** 工具执行上下文里的项目归属 */
+function execWorkspace(exec) {
+  return sessionWorkspace(exec?.agent?.session);
+}
+
+/**
+ * 把工具传入的 scope 归一成 listEntries 认识的三种取值。
+ * 未知取值一律退回 current（默认只搜当前项目 + 全局），避免拼错参数就变成全库检索。
+ */
+export function normalizeScope(value) {
+  const scope = String(value ?? '').trim().toLowerCase();
+  if (scope === 'global') return 'global';
+  if (scope === 'all') return 'all';
+  return 'current';
+}
+
 // 把一次会话整理成一条“对话记录”并写进记忆库
 export async function captureConversation(session, db) {
   if (!session || typeof session.deriveMessages !== 'function') return;
@@ -137,6 +164,7 @@ export async function captureConversation(session, db) {
     content: lines.join('\n\n'),
     category: '对话记录',
     tags: ['自动记录'],
+    workspaceId: sessionWorkspace(session),
   });
 }
 
@@ -288,6 +316,9 @@ function deleteDbEntriesByText(db, sessionId, category, texts) {
 export async function maybeCompressSession(ctx, agent, session, db, tierConfig) {
   if (!agent || !session) return;
 
+  // 本会话的项目归属：分层记忆与对话记录同属一个工作区
+  const workspaceId = sessionWorkspace(session);
+
   // 短期 → 中期
   const allItems = surfaceMessageSeqs(session);
   const rawItems = allItems.filter((item) => isRawChatMessage(item.message));
@@ -303,6 +334,7 @@ export async function maybeCompressSession(ctx, agent, session, db, tierConfig) 
       category: '中期记忆',
       tags: ['自动压缩'],
       sessionId: String(session.id),
+      workspaceId,
     });
   }
 
@@ -321,6 +353,7 @@ export async function maybeCompressSession(ctx, agent, session, db, tierConfig) 
       category: '长期记忆',
       tags: ['自动压缩'],
       sessionId: String(session.id),
+      workspaceId,
     });
     deleteDbEntriesByText(
       db,
@@ -344,6 +377,7 @@ export async function maybeCompressSession(ctx, agent, session, db, tierConfig) 
         category: '永久记忆',
         tags: ['自动吸收'],
         sessionId: String(session.id),
+        workspaceId,
       });
     }
     replaceSurfaceRange(session, [oldest], pluginMessage('【已归档的长期记忆】', 'discarded'));
@@ -465,28 +499,33 @@ export function apply(ctx, config = {}) {
 
   ctx.tools.register(defineTool({
     name: 'memory_add',
-    description: '向 dsh 外置记忆库新增一条长期记忆。当用户明确说“记住/记一下/存到记忆库”时使用。',
+    description: '向 dsh 外置记忆库新增一条长期记忆。当用户明确说“记住/记一下/存到记忆库”时使用。默认归属当前项目（按会话工作区），scope="global" 时写入全局（跨项目通用）。',
     parameters: {
       title: { type: 'string', required: true, description: '记忆条目标题，简短概括这条记忆。' },
       content: { type: 'string', description: '记忆详细内容。' },
       category: { type: 'string', description: '分类名，默认“未分类”。' },
       tags: { type: 'array', items: { type: 'string' }, description: '标签列表，用于以后筛选。' },
+      scope: { type: 'string', description: '归属范围：current（默认，当前项目）或 global（跨项目通用）。' },
     },
     output: {
       schema: { type: 'string' },
       render: (_args, value) => [{ type: 'text', text: value }],
     },
-    async execute(args) {
+    async execute(args, exec) {
       try {
         const title = String(args.title || '').trim();
         if (!title) return '新增失败：标题不能为空。';
+        const wantGlobal = String(args.scope || '').trim().toLowerCase() === 'global';
+        const workspaceId = wantGlobal ? null : execWorkspace(exec);
         const id = addEntry(db, {
           title,
           content: String(args.content || ''),
           category: String(args.category || '未分类').trim() || '未分类',
           tags: args.tags,
+          workspaceId,
         });
-        return `已记住，编号（ID）：${id}`;
+        const where = workspaceId ? `，归属项目：${workspaceLabel(workspaceId)}` : '，归属：全局';
+        return `已记住，编号（ID）：${id}${where}`;
       } catch (error) {
         logError('memory_add', error);
         return `新增记忆失败：${error?.message || error}`;
@@ -496,24 +535,27 @@ export function apply(ctx, config = {}) {
 
   ctx.tools.register(defineTool({
     name: 'memory_list',
-    description: '列出 dsh 外置记忆库中的记忆条目。默认不包含自动保存的“对话记录”，可按分类、标签筛选。',
+    description: '列出 dsh 外置记忆库中的记忆条目。默认只列当前项目 + 全局，不包含自动保存的“对话记录”，可按分类、标签筛选。',
     parameters: {
       category: { type: 'string', description: '只列出该分类下的记忆。' },
       tag: { type: 'string', description: '只列出带该标签的记忆。' },
       includeArchived: { type: 'boolean', description: '是否包含已归档条目，默认 false。' },
       includeConversations: { type: 'boolean', description: '是否同时列出“对话记录”，默认 false。' },
+      scope: { type: 'string', description: '检索范围：current（默认，当前项目 + 全局）、global（只看全局）、all（所有项目）。' },
     },
     output: {
       schema: { type: 'string' },
       render: (_args, value) => [{ type: 'text', text: value }],
     },
-    async execute(args) {
+    async execute(args, exec) {
       try {
         const rows = listEntries(db, {
           category: args.category,
           tag: args.tag,
           includeArchived: Boolean(args.includeArchived),
           excludeCategory: args.includeConversations ? undefined : '对话记录',
+          workspaceId: execWorkspace(exec),
+          workspaceScope: normalizeScope(args.scope),
         });
         return formatList(rows);
       } catch (error) {
@@ -525,22 +567,25 @@ export function apply(ctx, config = {}) {
 
   ctx.tools.register(defineTool({
     name: 'memory_search',
-    description: '在 dsh 外置记忆库中按关键词搜索记忆。当用户要求“回忆/查一下记忆/上次我让你记什么”时使用。',
+    description: '在 dsh 外置记忆库中按关键词搜索记忆。当用户要求“回忆/查一下记忆/上次我让你记什么”时使用。默认只搜当前项目 + 全局。',
     parameters: {
       query: { type: 'string', required: true, description: '要搜索的关键词。' },
       includeArchived: { type: 'boolean', description: '是否搜索已归档条目，默认 false。' },
+      scope: { type: 'string', description: '检索范围：current（默认，当前项目 + 全局）、global（只看全局）、all（所有项目）。' },
     },
     output: {
       schema: { type: 'string' },
       render: (_args, value) => [{ type: 'text', text: value }],
     },
-    async execute(args) {
+    async execute(args, exec) {
       try {
         const query = String(args.query || '').trim();
         if (!query) return '搜索失败：关键词不能为空。';
         const rows = listEntries(db, {
           search: query,
           includeArchived: Boolean(args.includeArchived),
+          workspaceId: execWorkspace(exec),
+          workspaceScope: normalizeScope(args.scope),
         });
         return formatList(rows);
       } catch (error) {
@@ -748,16 +793,17 @@ export function apply(ctx, config = {}) {
 
   ctx.tools.register(defineTool({
     name: 'memory_search_history',
-    description: '在自动保存的“对话记录”里搜索历史对话。当用户问“之前说过什么/上次聊了什么/查一下历史”时使用。',
+    description: '在自动保存的“对话记录”里搜索历史对话。当用户问“之前说过什么/上次聊了什么/查一下历史”时使用。默认只搜当前项目 + 全局。',
     parameters: {
       query: { type: 'string', required: true, description: '要搜索的关键词。' },
       includeArchived: { type: 'boolean', description: '是否搜索已归档记录，默认 false。' },
+      scope: { type: 'string', description: '检索范围：current（默认，当前项目 + 全局）、global（只看全局）、all（所有项目）。' },
     },
     output: {
       schema: { type: 'string' },
       render: (_args, value) => [{ type: 'text', text: value }],
     },
-    async execute(args) {
+    async execute(args, exec) {
       try {
         const query = String(args.query || '').trim();
         if (!query) return '搜索失败：关键词不能为空。';
@@ -765,6 +811,8 @@ export function apply(ctx, config = {}) {
           category: '对话记录',
           search: query,
           includeArchived: Boolean(args.includeArchived),
+          workspaceId: execWorkspace(exec),
+          workspaceScope: normalizeScope(args.scope),
         });
         return formatList(rows);
       } catch (error) {
@@ -776,19 +824,22 @@ export function apply(ctx, config = {}) {
 
   ctx.tools.register(defineTool({
     name: 'memory_list_conversations',
-    description: '列出自动保存的“对话记录”条目，方便查看有哪些历史对话。',
+    description: '列出自动保存的“对话记录”条目，方便查看有哪些历史对话。默认只列当前项目 + 全局。',
     parameters: {
       includeArchived: { type: 'boolean', description: '是否包含已归档记录，默认 false。' },
+      scope: { type: 'string', description: '检索范围：current（默认，当前项目 + 全局）、global（只看全局）、all（所有项目）。' },
     },
     output: {
       schema: { type: 'string' },
       render: (_args, value) => [{ type: 'text', text: value }],
     },
-    async execute(args) {
+    async execute(args, exec) {
       try {
         const rows = listEntries(db, {
           category: '对话记录',
           includeArchived: Boolean(args.includeArchived),
+          workspaceId: execWorkspace(exec),
+          workspaceScope: normalizeScope(args.scope),
         });
         return formatList(rows);
       } catch (error) {
@@ -908,7 +959,7 @@ export function apply(ctx, config = {}) {
         const id = Number(args.id);
         const old = getEntry(db, id);
         if (!old) return '没有找到这个编号的记忆条目。';
-        const updated = updateEntry(db, id, { category: '预设', sessionId: null });
+        const updated = updateEntry(db, id, { category: '预设', sessionId: null, workspaceId: null });
         return `已升级为全局预设/用户记忆，编号（ID）：${updated.id}`;
       } catch (error) {
         logError('memory_promote_preset', error);
